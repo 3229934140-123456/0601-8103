@@ -30,11 +30,14 @@ class Transaction:
     - txn_id: 全局唯一事务ID
     - read_ts: 快照时间戳，决定该事务能看到哪些版本
     - status: 事务状态 (active, committed, aborted)
+    - writes: 写入集（暂存的修改）
+    - reads: 读取集（key -> 读取时看到的版本的create_ts），用于OCC冲突检测
     """
     txn_id: str
     read_ts: int
     status: str = "active"
     writes: Dict[str, Any] = field(default_factory=dict)
+    reads: Dict[str, int] = field(default_factory=dict)
 
 
 class TransactionManager:
@@ -42,34 +45,55 @@ class TransactionManager:
     事务管理器
     
     核心职责：
-    1. 分配单调递增的时间戳（用于 read_ts 和 commit_ts）
-    2. 追踪所有活跃事务及其 read_ts
-    3. 计算低水位（Low Water Mark）- 所有活跃事务中最小的 read_ts
-    4. 低水位是GC的依据：所有 expire_ts < low_water_mark 的版本都可安全回收
+    1. 分配单调递增的时间戳（用于 commit_ts）
+    2. 维护 committed_ts：最近一次完整提交的时间戳
+       - 所有 <= committed_ts 的事务都已经完整提交
+       - 读事务的 read_ts = committed_ts，保证看到一致的快照
+    3. 追踪所有活跃事务及其 read_ts
+    4. 计算低水位（Low Water Mark）- 所有活跃事务中最小的 read_ts
+    5. 低水位是GC的依据：所有 expire_ts < low_water_mark 的版本都可安全回收
     """
     
     def __init__(self):
         self._timestamp = 0
         self._ts_lock = threading.Lock()
+        self._committed_ts = 0
         self._active_txns: Dict[str, Transaction] = {}
         self._active_lock = threading.Lock()
         self._low_water_mark = 0
     
     def allocate_ts(self) -> int:
-        """分配下一个单调递增的时间戳"""
+        """分配下一个单调递增的时间戳（用于commit_ts）"""
         with self._ts_lock:
             self._timestamp += 1
             return self._timestamp
+    
+    def get_committed_ts(self) -> int:
+        """获取最近一次完整提交的时间戳（线程安全）"""
+        return self._committed_ts
+    
+    def set_committed_ts(self, ts: int):
+        """
+        更新已提交时间戳（必须在提交完成后调用）
+        
+        这是保证快照一致性的关键：
+        - 只有当一个事务的所有写入都完成后，才更新 committed_ts
+        - 读事务的 read_ts = committed_ts，所以要么看到全部修改，要么看不到任何修改
+        - committed_ts 单调不减
+        """
+        if ts > self._committed_ts:
+            self._committed_ts = ts
     
     def begin_txn(self) -> Transaction:
         """
         开始一个新事务
         
-        1. 分配 read_ts（快照时间戳）
+        1. 获取 read_ts = committed_ts（最近一次完整提交的时间戳）
+           这样保证事务看到的是一个一致的快照
         2. 将事务加入活跃事务表
         3. 更新低水位
         """
-        read_ts = self.allocate_ts()
+        read_ts = self._committed_ts
         txn_id = str(uuid.uuid4())
         txn = Transaction(txn_id=txn_id, read_ts=read_ts)
         
@@ -158,24 +182,69 @@ class MVCCKVStore:
     
     def commit(self, txn: Transaction) -> bool:
         """
-        提交事务
+        提交事务 - 采用乐观并发控制（OCC），首提交者胜出
         
-        对于写事务，需要：
-        1. 分配 commit_ts
-        2. 将暂存的写入应用到版本链（创建新版本）
-        3. 标记旧版本过期
-        4. 结束事务
+        提交阶段：
+        1. 校验阶段（Validation）：检查读取集是否被其他事务修改
+        2. 写阶段（Write）：校验通过后，原子性地应用所有写入
+        3. 发布阶段（Publish）：更新 committed_ts，让新的读事务能看到这次提交
+        4. 结束阶段：更新事务状态
+        
+        关键设计：committed_ts 在所有写入完成后才更新
+        - 保证读事务要么看到全部修改，要么看不到任何修改
+        - 实现多key原子提交的可见性
+        
+        返回值：
+        - True: 提交成功
+        - False: 提交失败（发生写-写冲突），调用方应重试或放弃
         """
         if txn.status != "active":
             return False
         
-        if txn.writes:
+        if not txn.writes:
+            self._txn_manager.end_txn(txn, "committed")
+            return True
+        
+        commit_ts = None
+        with self._store_lock:
+            if not self._validate(txn):
+                self._txn_manager.end_txn(txn, "aborted")
+                return False
+            
             commit_ts = self._txn_manager.allocate_ts()
-            with self._store_lock:
-                for key, value in txn.writes.items():
-                    self._apply_write(key, value, commit_ts)
+            for key, value in txn.writes.items():
+                self._apply_write(key, value, commit_ts)
+        
+        self._txn_manager.set_committed_ts(commit_ts)
         
         self._txn_manager.end_txn(txn, "committed")
+        return True
+    
+    def _validate(self, txn: Transaction) -> bool:
+        """
+        OCC校验：检查读取集是否被其他事务修改
+        
+        必须在持有 _store_lock 时调用
+        
+        校验规则：
+        - 对于读取集中的每个key：
+          - 如果读取时记录版本为0（不存在），现在也不存在 → OK
+          - 如果读取时记录版本为0，现在存在了 → 冲突（phantom read）
+          - 如果读取时有版本，现在没了 → 冲突（被删除）
+          - 如果读取时有版本，现在最新版本的create_ts不同 → 冲突（被修改）
+        """
+        for key, read_version in txn.reads.items():
+            versions = self._versions.get(key, [])
+            
+            if read_version == 0:
+                if versions:
+                    return False
+            else:
+                if not versions:
+                    return False
+                if versions[0].create_ts != read_version:
+                    return False
+        
         return True
     
     def abort(self, txn: Transaction):
@@ -196,6 +265,10 @@ class MVCCKVStore:
            或 expire_ts is None            (仍是最新版本)
         
         读操作不需要加锁，实现"读永不阻塞写"
+        
+        同时记录读取集（read set），用于提交时的OCC冲突检测：
+        - 如果key存在，记录可见版本的create_ts
+        - 如果key不存在，记录特殊标记0
         """
         if txn.status != "active":
             raise RuntimeError(f"Transaction is {txn.status}, cannot read")
@@ -208,8 +281,10 @@ class MVCCKVStore:
         for version in versions:
             if version.create_ts <= txn.read_ts:
                 if version.expire_ts is None or version.expire_ts > txn.read_ts:
+                    txn.reads[key] = version.create_ts
                     return version.value
         
+        txn.reads[key] = 0
         return None
     
     def put(self, txn: Transaction, key: str, value: Any):

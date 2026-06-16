@@ -209,17 +209,24 @@ class TestGarbageCollection:
             assert store.get_low_water_mark() > 0
             
             txn1 = store.begin()
+            
+            store.simple_put("dummy", "1")
             txn2 = store.begin()
+            
+            store.simple_put("dummy", "2")
             txn3 = store.begin()
             
             lwm = store.get_low_water_mark()
             active_ts = store.get_active_read_timestamps()
             assert lwm == min(active_ts)
+            assert len(active_ts) == 3, "三个事务应该有不同的read_ts"
             
             store.commit(txn1)
             
             new_lwm = store.get_low_water_mark()
-            assert new_lwm > lwm or len(store.get_active_read_timestamps()) == 2
+            new_active_ts = store.get_active_read_timestamps()
+            assert len(new_active_ts) == 2
+            assert new_lwm > lwm, "t1结束后，低水位应该上升"
             
             store.commit(txn2)
             store.commit(txn3)
@@ -247,26 +254,25 @@ class TestGarbageCollection:
         """
         长事务阻塞GC的精确时机测试
         
-        时间轴（时间戳递增）：
-        [TS=1] begin txn_v0
-        [TS=2] commit txn_v0 → v0.create_ts=2, v0.expire_ts=None
-        [TS=3] begin t1 → t1.read_ts=3
-        [TS=4] begin t2 → t2.read_ts=4  ★ 关键点：t2在v1之前开始
-        [TS=5] begin txn_v1
-        [TS=6] commit txn_v1 → v1.create_ts=6, v0.expire_ts=6
+        时间轴：
+        [阶段1] 提交 v0 → committed_ts = C0
+        [阶段2] t1开始 → t1.read_ts = C0
+        [阶段3] 提交 dummy写 → committed_ts = C1
+        [阶段4] t2开始 → t2.read_ts = C1
+        [阶段5] 提交 v1 → v0.expire_ts = C2, committed_ts = C2
         
         可见性分析：
-        - t1 (read_ts=3): 能看到v0 (create_ts=2<=3, expire_ts=6>3)
-        - t2 (read_ts=4): 能看到v0 (create_ts=2<=4, expire_ts=6>4)
-                        看不到v1 (create_ts=6>4)
+        - t1 (read_ts=C0): 能看到v0 (create_ts=C0<=C0, expire_ts=C2>C0)
+        - t2 (read_ts=C1): 能看到v0 (create_ts=C0<=C1, expire_ts=C2>C1)
+                        看不到v1 (create_ts=C2>C1)
         
         GC时机分析：
-        1. t1和t2都活跃时，低水位=min(3,4)=3
-           v0.expire_ts=6 > 3 → 不可回收
-        2. t1结束后，低水位=4
-           v0.expire_ts=6 > 4 → 仍不可回收（t2还需要）
-        3. t2结束后，低水位=6（或更高）
-           v0.expire_ts=6 <= 6 → 可以回收！
+        1. t1和t2都活跃时，低水位=min(C0, C1) = C0
+           v0.expire_ts=C2 > C0 → 不可回收
+        2. t1结束后，低水位=C1
+           v0.expire_ts=C2 > C1 → 仍不可回收（t2还需要）
+        3. t2结束后，低水位=C2（或更高）
+           v0.expire_ts=C2 <= C2 → 可以回收！
         """
         with MVCCKVStore(gc_enabled=False) as store:
             txn_v0 = store.begin()
@@ -281,10 +287,12 @@ class TestGarbageCollection:
             t1_read_ts = t1.read_ts
             assert store.get(t1, "key") == "v0"
             
+            store.simple_put("dummy", "1")
+            
             t2 = store.begin()
             t2_read_ts = t2.read_ts
             assert store.get(t2, "key") == "v0"
-            assert t2_read_ts > t1_read_ts
+            assert t2_read_ts > t1_read_ts, "t2应该在t1之后开始，有更大的read_ts"
             
             txn_v1 = store.begin()
             store.put(txn_v1, "key", "v1")
