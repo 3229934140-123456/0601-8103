@@ -222,16 +222,21 @@ class MVCCKVStore:
     
     def _validate(self, txn: Transaction) -> bool:
         """
-        OCC校验：检查读取集是否被其他事务修改
+        OCC校验：检查读取集和写入集是否被其他事务修改
         
         必须在持有 _store_lock 时调用
         
         校验规则：
-        - 对于读取集中的每个key：
-          - 如果读取时记录版本为0（不存在），现在也不存在 → OK
-          - 如果读取时记录版本为0，现在存在了 → 冲突（phantom read）
-          - 如果读取时有版本，现在没了 → 冲突（被删除）
-          - 如果读取时有版本，现在最新版本的create_ts不同 → 冲突（被修改）
+        1. 读取集校验（防止读到的数据被修改）：
+           - 如果读取时记录版本为0（不存在），现在也不存在 → OK
+           - 如果读取时记录版本为0，现在存在了 → 冲突（phantom read）
+           - 如果读取时有版本，现在没了 → 冲突（被删除）
+           - 如果读取时有版本，现在最新版本的create_ts不同 → 冲突（被修改）
+        
+        2. 写入集校验（防止只写不读的场景下丢失更新）：
+           - 对于写入集中的每个key，如果它不在读取集中（没读过直接写）：
+             - 如果key在事务快照时刻（read_ts）之后被其他事务修改或创建过 → 冲突
+           - 这样两个同一快照开始的事务都写同一个key时，后提交者明确失败
         """
         for key, read_version in txn.reads.items():
             versions = self._versions.get(key, [])
@@ -244,6 +249,18 @@ class MVCCKVStore:
                     return False
                 if versions[0].create_ts != read_version:
                     return False
+        
+        for key in txn.writes:
+            if key in txn.reads:
+                continue
+            
+            versions = self._versions.get(key, [])
+            if not versions:
+                continue
+            
+            latest_create_ts = versions[0].create_ts
+            if latest_create_ts > txn.read_ts:
+                return False
         
         return True
     
@@ -445,6 +462,117 @@ class MVCCKVStore:
         txn = self.begin()
         self.put(txn, key, value)
         self.commit(txn)
+    
+    # ============= 批量接口 =============
+    
+    def batch_get(self, keys: List[str]) -> Dict[str, Any]:
+        """
+        批量读取接口（自动事务）
+        
+        在同一个事务中读取多个key，保证看到一致的快照
+        返回：{key: value} 的字典，不存在的key对应None
+        """
+        txn = self.begin()
+        try:
+            result = {}
+            for key in keys:
+                result[key] = self.get(txn, key)
+            return result
+        finally:
+            self.commit(txn)
+    
+    def batch_put(self, items: Dict[str, Any]) -> bool:
+        """
+        批量写入接口（自动事务）
+        
+        在同一个事务中写入多个key，保证原子提交可见性
+        要么所有写入都成功并被看到，要么都不被看到
+        
+        返回：True表示提交成功，False表示提交冲突
+        """
+        txn = self.begin()
+        for key, value in items.items():
+            self.put(txn, key, value)
+        return self.commit(txn)
+    
+    def batch(self, get_keys: List[str] = None, 
+              put_items: Dict[str, Any] = None) -> Tuple[bool, Dict[str, Any]]:
+        """
+        通用批量操作接口：一次事务内完成多个读和多个写
+        
+        适合转账、批量更新等需要原子性的场景：
+        - 所有读取和写入都在同一个快照下进行
+        - 所有写入原子性地发布（要么都可见，要么都不可见）
+        - 提交时会做完整的OCC冲突检测
+        
+        参数：
+        - get_keys: 需要读取的key列表
+        - put_items: 需要写入的 {key: value} 字典
+        
+        返回：
+        - (success, read_results)
+          - success: True表示提交成功，False表示提交冲突
+          - read_results: {key: value} 的读取结果（即使提交失败也会返回读取值）
+        """
+        get_keys = get_keys or []
+        put_items = put_items or {}
+        
+        txn = self.begin()
+        try:
+            read_results = {}
+            for key in get_keys:
+                read_results[key] = self.get(txn, key)
+            
+            for key, value in put_items.items():
+                self.put(txn, key, value)
+            
+            success = self.commit(txn)
+            return success, read_results
+        except Exception:
+            self.abort(txn)
+            raise
+    
+    # ============= 事务重试工具 =============
+    
+    def run_transaction(self, fn, max_retries: int = 10) -> Tuple[bool, Any, int]:
+        """
+        事务重试工具：自动重试读改写逻辑
+        
+        适用于典型的"读取-计算-写入"事务模式，遇到提交冲突时自动重试
+        
+        参数：
+        - fn: 用户提供的事务函数，签名为 fn(txn: Transaction) -> Any
+              在fn内部可以调用 self.get(txn, key) 和 self.put(txn, key, value)
+              fn的返回值会作为最终结果返回
+        - max_retries: 最大重试次数（默认10次），超过后返回失败
+        
+        返回：
+        - (success, result, attempts)
+          - success: True表示最终提交成功，False表示重试次数耗尽仍失败
+          - result: fn的返回值（如果fn执行过的话，失败时可能为None）
+          - attempts: 实际尝试的次数
+        
+        使用示例：
+        ```python
+        def increment_counter(txn):
+            current = store.get(txn, "counter") or 0
+            store.put(txn, "counter", current + 1)
+            return current + 1
+        
+        success, new_value, attempts = store.run_transaction(increment_counter)
+        ```
+        """
+        last_result = None
+        for attempt in range(1, max_retries + 1):
+            txn = self.begin()
+            try:
+                last_result = fn(txn)
+                if self.commit(txn):
+                    return True, last_result, attempt
+            except Exception:
+                self.abort(txn)
+                raise
+        return False, last_result, max_retries
     
     def __enter__(self):
         return self
